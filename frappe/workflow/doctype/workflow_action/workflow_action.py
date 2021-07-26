@@ -42,8 +42,8 @@ def process_workflow_actions(doc, state):
 
 	if is_workflow_action_already_created(doc): return
 
-	clear_old_workflow_actions(doc)
-	update_completed_workflow_actions(doc)
+#	clear_old_workflow_actions(doc)
+#	update_completed_workflow_actions(doc)
 	clear_doctype_notifications('Workflow Action')
 
 	next_possible_transitions = get_next_possible_transitions(workflow, get_doc_workflow_state(doc), doc)

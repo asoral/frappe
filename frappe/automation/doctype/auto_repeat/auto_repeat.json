@@ -110,7 +110,6 @@
    "label": "Next Schedule Date",
    "no_copy": 1,
    "print_hide": 1,
-   "read_only": 1,
    "search_index": 1
   },
   {
@@ -211,7 +210,7 @@
   }
  ],
  "links": [],
- "modified": "2021-01-12 09:24:49.719611",
+ "modified": "2021-07-05 11:14:03.510466",
  "modified_by": "Administrator",
  "module": "Automation",
  "name": "Auto Repeat",

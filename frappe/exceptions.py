@@ -19,7 +19,7 @@ class SiteNotSpecifiedError(Exception):
 		super(Exception, self).__init__(self.message)
 
 class ValidationError(Exception):
-	http_status_code = 417
+	http_status_code = 200
 
 class AuthenticationError(Exception):
 	http_status_code = 401
@@ -49,7 +49,7 @@ class UnsupportedMediaType(Exception):
 	http_status_code = 415
 
 class RequestToken(Exception):
-	http_status_code = 200
+	http_status_code = 417
 
 class Redirect(Exception):
 	http_status_code = 301

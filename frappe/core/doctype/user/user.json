@@ -378,7 +378,7 @@
   },
   {
    "fieldname": "email_signature",
-   "fieldtype": "Small Text",
+   "fieldtype": "HTML Editor",
    "label": "Email Signature",
    "no_copy": 1
   },
@@ -670,7 +670,7 @@
   }
  ],
  "max_attachments": 5,
- "modified": "2021-02-02 16:11:06.037543",
+ "modified": "2021-07-17 16:10:56.236821",
  "modified_by": "Administrator",
  "module": "Core",
  "name": "User",
