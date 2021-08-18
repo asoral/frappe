@@ -17,6 +17,8 @@ from frappe.utils.background_jobs import get_jobs
 from frappe.automation.doctype.assignment_rule.assignment_rule import get_repeated
 from frappe.contacts.doctype.contact.contact import get_contacts_linked_from
 from frappe.contacts.doctype.contact.contact import get_contacts_linking_to
+from frappe.utils.file_manager import save_url
+import frappe, erpnext, math, json
 
 month_map = {'Monthly': 1, 'Quarterly': 3, 'Half-yearly': 6, 'Yearly': 12}
 week_map = {'Monday': 0, 'Tuesday': 1, 'Wednesday': 2, 'Thursday': 3, 'Friday': 4, 'Saturday': 5, 'Sunday': 6}
@@ -168,8 +170,17 @@ class AutoRepeat(Document):
 
 		if self.submit_on_creation:
 			new_doc.submit()
+		# attachment
+		reference_doc_json = json.loads(reference_doc.as_json())
+		new_doc_json = json.loads(new_doc.as_json())
+
+		for file_url in frappe.db.sql(
+			"""select file_url,file_name from `tabFile` where attached_to_doctype = %(doctype)s and     attached_to_name = %(docname)s""",
+			{'doctype': reference_doc_json["doctype"], 'docname': reference_doc_json["name"]}, as_dict=True):
+			save_url(file_url.file_url, file_url.file_name, new_doc_json["doctype"], new_doc_json["name"], "Home/Attachments", 0)
 
 		return new_doc
+
 
 	def update_doc(self, new_doc, reference_doc):
 		new_doc.docstatus = 0
@@ -390,7 +401,6 @@ def make_auto_repeat_entry():
 	jobs = get_jobs()
 
 	if not jobs or enqueued_method not in jobs[frappe.local.site]:
-		print("*************************jobs")
 		date = getdate(today())
 		data = get_auto_repeat_entries(date)
 		frappe.enqueue(enqueued_method, data=data)
@@ -399,7 +409,7 @@ def make_auto_repeat_entry():
 def create_repeated_entries(data):
 	for d in data:
 		doc = frappe.get_doc('Auto Repeat', d.name)
-		print ("**************",data)
+
 		current_date = getdate(today())
 		schedule_date = getdate(doc.next_schedule_date)
 
