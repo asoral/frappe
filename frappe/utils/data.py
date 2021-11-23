@@ -727,13 +727,13 @@ def rounded(num, precision=0):
 	floor_num = math.floor(num)
 	decimal_part = num - floor_num
 
-	if not precision and decimal_part == 0.5:
-		num = floor_num if (floor_num % 2 == 0) else floor_num + 1
+# 	if not precision and decimal_part == 0.5:
+# 		num = floor_num if (floor_num % 2 == 0) else floor_num + 1
+# 	else:
+	if decimal_part >= 0.5:
+		num = floor_num + 1
 	else:
-		if decimal_part => 0.5:
-			num = floor_num + 1
-		else:
-			num = floor_num
+		num = floor_num
 
 	return (num / multiplier) if precision else num
 
