@@ -76,9 +76,12 @@ def get_controller(doctype):
 	return site_controllers[doctype]
 
 class BaseDocument(object):
-	ignore_in_getter = ("doctype", "_meta", "meta", "_table_fields", "_valid_columns")
+	ignore_in_setter = ("doctype", "_meta", "meta", "_table_fields", "_valid_columns")
 
 	def __init__(self, d):
+		if d.get("doctype"):
+			self.doctype = d["doctype"]
+
 		self.update(d)
 		self.dont_update_if_missing = []
 
@@ -101,13 +104,10 @@ class BaseDocument(object):
 				"balance": 42000
 			})
 		"""
-		if "doctype" in d:
-			self.set("doctype", d.get("doctype"))
 
-		# first set default field values of base document
-		for key in default_fields:
-			if key in d:
-				self.set(key, d.get(key))
+		# set name first, as it is used a reference in child document
+		if "name" in d:
+			self.name = d["name"]
 
 		for key, value in iteritems(d):
 			self.set(key, value)
@@ -115,14 +115,18 @@ class BaseDocument(object):
 		return self
 
 	def update_if_missing(self, d):
+		"""Set default values for fields without existing values"""
 		if isinstance(d, BaseDocument):
 			d = d.get_valid_dict()
 
-		if "doctype" in d:
-			self.set("doctype", d.get("doctype"))
 		for key, value in iteritems(d):
-			# dont_update_if_missing is a list of fieldnames, for which, you don't want to set default value
-			if (self.get(key) is None) and (value is not None) and (key not in self.dont_update_if_missing):
+			if (
+				value is not None
+				and self.get(key) is None
+				# dont_update_if_missing is a list of fieldnames
+				# for which you don't want to set default value
+				and key not in self.dont_update_if_missing
+			):
 				self.set(key, value)
 
 	def get_db_value(self, key):
@@ -142,10 +146,14 @@ class BaseDocument(object):
 			else:
 				value = self.__dict__.get(key, default)
 
-			if value is None and key not in self.ignore_in_getter \
-				and key in (d.fieldname for d in self.meta.get_table_fields()):
-				self.set(key, [])
-				value = self.__dict__.get(key)
+			if value is None and key in (
+				d.fieldname for d in self.meta.get_table_fields()
+			):
+				value = []
+				self.set(key, value)
+
+			if limit and isinstance(value, (list, tuple)) and len(value) > limit:
+				value = value[:limit]
 
 			return value
 		else:
@@ -155,6 +163,9 @@ class BaseDocument(object):
 		return self.get(key, filters=filters, limit=1)[0]
 
 	def set(self, key, value, as_value=False):
+		if key in self.ignore_in_setter:
+			return
+
 		if isinstance(value, list) and not as_value:
 			self.__dict__[key] = []
 			self.extend(key, value)
@@ -180,6 +191,7 @@ class BaseDocument(object):
 		if isinstance(value, (dict, BaseDocument)):
 			if not self.__dict__.get(key):
 				self.__dict__[key] = []
+
 			value = self._init_child(value, key)
 			self.__dict__[key].append(value)
 
@@ -213,11 +225,11 @@ class BaseDocument(object):
 	def _init_child(self, value, key):
 		if not self.doctype:
 			return value
+
 		if not isinstance(value, BaseDocument):
-			if "doctype" not in value or value['doctype'] is None:
-				value["doctype"] = self.get_table_field_doctype(key)
-				if not value["doctype"]:
-					raise AttributeError(key)
+			value["doctype"] = self.get_table_field_doctype(key)
+			if not value["doctype"]:
+				raise AttributeError(key)
 
 			value = get_controller(value["doctype"])(value)
 			value.init_valid_columns()
@@ -267,7 +279,12 @@ class BaseDocument(object):
 				if isinstance(d[fieldname], list) and df.fieldtype not in table_fields:
 					frappe.throw(_('Value for {0} cannot be a list').format(_(df.label)))
 
-			if convert_dates_to_str and isinstance(d[fieldname], (datetime.datetime, datetime.time, datetime.timedelta)):
+			if convert_dates_to_str and isinstance(d[fieldname], (
+				datetime.datetime,
+				datetime.date,
+				datetime.time,
+				datetime.timedelta
+			)):
 				d[fieldname] = str(d[fieldname])
 
 			if d[fieldname] == None and ignore_nulls:
@@ -307,7 +324,7 @@ class BaseDocument(object):
 		doc["doctype"] = self.doctype
 		for df in self.meta.get_table_fields():
 			children = self.get(df.fieldname) or []
-			doc[df.fieldname] = [d.as_dict(convert_dates_to_str=convert_dates_to_str, no_nulls=no_nulls) for d in children]
+			doc[df.fieldname] = [d.as_dict(convert_dates_to_str=convert_dates_to_str, no_nulls=no_nulls, no_default_fields=no_default_fields) for d in children]
 
 		if no_nulls:
 			for k in list(doc):
@@ -667,6 +684,12 @@ class BaseDocument(object):
 			if data_field_options == "Phone":
 				frappe.utils.validate_phone_number(data, throw=True)
 
+			if data_field_options == "URL":
+				if not data:
+					continue
+
+				frappe.utils.validate_url(data, throw=True)
+
 	def _validate_constants(self):
 		if frappe.flags.in_import or self.is_new() or self.flags.ignore_validate_constants:
 			return
@@ -720,6 +743,18 @@ class BaseDocument(object):
 
 				if abs(cint(value)) > max_length:
 					self.throw_length_exceeded_error(df, max_length, value)
+
+	def _validate_code_fields(self):
+		for field in self.meta.get_code_fields():
+			code_string = self.get(field.fieldname)
+			language = field.get("options")
+
+			if language == "Python":
+				frappe.utils.validate_python_code(code_string, fieldname=field.label, is_expression=False)
+
+			elif language == "PythonExpression":
+				frappe.utils.validate_python_code(code_string, fieldname=field.label)
+
 
 	def throw_length_exceeded_error(self, df, max_length, value):
 		if self.parentfield and self.idx:
@@ -856,7 +891,7 @@ class BaseDocument(object):
 		return self._precision[cache_key][fieldname]
 
 
-	def get_formatted(self, fieldname, doc=None, currency=None, absolute_value=False, translated=False):
+	def get_formatted(self, fieldname, doc=None, currency=None, absolute_value=False, translated=False, format=None):
 		from frappe.utils.formatters import format_value
 
 		df = self.meta.get_field(fieldname)
@@ -864,7 +899,7 @@ class BaseDocument(object):
 			from frappe.model.meta import get_default_df
 			df = get_default_df(fieldname)
 
-		if not currency:
+		if df and not currency:
 			currency = self.get(df.get("options"))
 			if not frappe.db.exists('Currency', currency, cache=True):
 				currency = None
@@ -880,7 +915,7 @@ class BaseDocument(object):
 		if (absolute_value or doc.get('absolute_value')) and isinstance(val, (int, float)):
 			val = abs(self.get(fieldname))
 
-		return format_value(val, df=df, doc=doc, currency=currency)
+		return format_value(val, df=df, doc=doc, currency=currency, format=format)
 
 	def is_print_hide(self, fieldname, df=None, for_print=True):
 		"""Returns true if fieldname is to be hidden for print.
@@ -951,7 +986,7 @@ class BaseDocument(object):
 		return self.cast(val, df)
 
 	def cast(self, value, df):
-		return cast_fieldtype(df.fieldtype, value)
+		return cast_fieldtype(df.fieldtype, value, show_warning=False)
 
 	def _extract_images_from_text_editor(self):
 		from frappe.core.doctype.file.file import extract_images_from_doc
@@ -988,15 +1023,12 @@ def _filter(data, filters, limit=None):
 			_filters[f] = fval
 
 	for d in data:
-		add = True
-		for f, fval in iteritems(_filters):
+		for f, fval in _filters.items():
 			if not frappe.compare(getattr(d, f, None), fval[0], fval[1]):
-				add = False
 				break
-
-		if add:
+		else:
 			out.append(d)
-			if limit and (len(out)-1)==limit:
+			if limit and len(out) >= limit:
 				break
 
 	return out
