@@ -10,6 +10,7 @@ from frappe.modules import get_doc_path
 from frappe.core.doctype.access_log.access_log import make_access_log
 from frappe.utils import cint, sanitize_html, strip_html
 from six import string_types
+from frappe.utils.jinja import is_rtl
 
 no_cache = 1
 
@@ -48,7 +49,8 @@ def get_context(context):
 		"css": get_print_style(frappe.form_dict.style, print_format),
 		"comment": frappe.session.user,
 		"title": doc.get(meta.title_field) if meta.title_field else doc.name,
-		"has_rtl": True if frappe.local.lang in ["ar", "he", "fa", "ps"] else False
+		"lang": frappe.local.lang,
+		"layout_direction": "rtl" if is_rtl() else "ltr"
 	}
 
 def get_print_format_doc(print_format_name, meta):
@@ -154,7 +156,12 @@ def get_rendered_template(doc, name=None, print_format=None, meta=None,
 
 	convert_markdown(doc, meta)
 
-	args = {
+	args = {}
+	# extract `print_heading_template` from the first field and remove it
+	if format_data and format_data[0].get("fieldname") == "print_heading_template":
+		args["print_heading_template"] = format_data.pop(0).get("options")
+
+	args.update({
 		"doc": doc,
 		"meta": frappe.get_meta(doc.doctype),
 		"layout": make_layout(doc, meta, format_data),
@@ -163,7 +170,7 @@ def get_rendered_template(doc, name=None, print_format=None, meta=None,
 		"letter_head": letter_head.content,
 		"footer": letter_head.footer,
 		"print_settings": print_settings
-	}
+	})
 
 	html = template.render(args, filters={"len": len})
 
@@ -277,13 +284,6 @@ def make_layout(doc, meta, format_data=None):
 	:param format_data: Fields sequence and properties defined by Print Format Builder."""
 	layout, page = [], []
 	layout.append(page)
-
-	if format_data:
-		# extract print_heading_template from the first field
-		# and remove the field
-		if format_data[0].get("fieldname") == "print_heading_template":
-			doc.print_heading_template = format_data[0].get("options")
-			format_data = format_data[1:]
 
 	def get_new_section(): return  {'columns': [], 'has_data': False}
 

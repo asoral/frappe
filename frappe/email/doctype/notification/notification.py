@@ -65,7 +65,7 @@ def get_context(context):
 """)
 
 	def validate_standard(self):
-		if self.is_standard and not frappe.conf.developer_mode:
+		if self.is_standard and self.enabled and not frappe.conf.developer_mode:
 			frappe.throw(_('Cannot edit Standard Notification. To edit, please disable this and duplicate it'))
 
 	def validate_condition(self):
@@ -150,6 +150,7 @@ def get_context(context):
 					if doc.meta.get_field(fieldname).fieldtype in frappe.model.numeric_fieldtypes:
 						value = frappe.utils.cint(value)
 
+					doc.reload()
 					doc.set(fieldname, value)
 					doc.flags.updater_reference = {
 						'doctype': self.doctype,
