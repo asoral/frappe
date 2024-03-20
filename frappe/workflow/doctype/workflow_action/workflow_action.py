@@ -43,16 +43,8 @@ def process_workflow_actions(doc, state):
 
 	if is_workflow_action_already_created(doc): return
 
-	delete={
-		"doc":doc
-	}
-	
-	enqueue(method=clear_old_workflow_actions, queue='long', timeout=3000,**delete)
-	
-	update={
-		"doc":doc
-		}
-	enqueue(method=update_completed_workflow_actions, queue='long', timeout=3000,**update)
+	clear_old_workflow_actions(doc)
+	update_completed_workflow_actions(doc)
 
 	
 	clear_doctype_notifications('Workflow Action')
