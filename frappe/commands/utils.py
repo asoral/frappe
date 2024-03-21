@@ -4,95 +4,157 @@ import json
 import os
 import subprocess
 import sys
-from distutils.spawn import find_executable
+import typing
 
 import click
 
 import frappe
+from frappe import _
 from frappe.commands import get_site, pass_context
+from frappe.coverage import CodeCoverage
 from frappe.exceptions import SiteNotSpecifiedError
-from frappe.utils import get_bench_path, update_progress_bar, cint
+from frappe.utils import cint, update_progress_bar
+
+EXTRA_ARGS_CTX = {"ignore_unknown_options": True, "allow_extra_args": True}
+
+if typing.TYPE_CHECKING:
+	from IPython.terminal.embed import InteractiveShellEmbed
 
 
-@click.command('build')
-@click.option('--app', help='Build assets for app')
-@click.option('--hard-link', is_flag=True, default=False, help='Copy the files instead of symlinking')
-@click.option('--make-copy', is_flag=True, default=False, help='[DEPRECATED] Copy the files instead of symlinking')
-@click.option('--restore', is_flag=True, default=False, help='[DEPRECATED] Copy the files instead of symlinking with force')
-@click.option('--verbose', is_flag=True, default=False, help='Verbose')
-@click.option('--force', is_flag=True, default=False, help='Force build assets instead of downloading available')
-def build(app=None, hard_link=False, make_copy=False, restore=False, verbose=False, force=False):
-	"Minify + concatenate JS and CSS files, build translations"
-	frappe.init('')
-	# don't minify in developer_mode for faster builds
-	no_compress = frappe.local.conf.developer_mode or False
+@click.command("build")
+@click.option("--app", help="Build assets for app")
+@click.option("--apps", help="Build assets for specific apps")
+@click.option(
+	"--hard-link",
+	is_flag=True,
+	default=False,
+	help="Copy the files instead of symlinking",
+	envvar="FRAPPE_HARD_LINK_ASSETS",
+)
+@click.option("--production", is_flag=True, default=False, help="Build assets in production mode")
+@click.option("--verbose", is_flag=True, default=False, help="Verbose")
+@click.option(
+	"--force", is_flag=True, default=False, help="Force build assets instead of downloading available"
+)
+@click.option(
+	"--save-metafiles",
+	is_flag=True,
+	default=False,
+	help="Saves esbuild metafiles for built assets. Useful for analyzing bundle size. More info: https://esbuild.github.io/api/#metafile",
+)
+@click.option(
+	"--using-cached",
+	is_flag=True,
+	default=False,
+	envvar="USING_CACHED",
+	help="Skips build and uses cached build artifacts (cache is set by Bench). Ignored if developer_mode enabled.",
+)
+def build(
+	app=None,
+	apps=None,
+	hard_link=False,
+	production=False,
+	verbose=False,
+	force=False,
+	save_metafiles=False,
+	using_cached=False,
+):
+	"Compile JS and CSS source files"
+	from frappe.build import bundle, download_frappe_assets
+	from frappe.gettext.translate import compile_translations
+	from frappe.utils.synchronization import filelock
 
-	# dont try downloading assets if force used, app specified or running via CI
-	if not (force or app or os.environ.get('CI')):
-		# skip building frappe if assets exist remotely
-		skip_frappe = frappe.build.download_frappe_assets(verbose=verbose)
-	else:
-		skip_frappe = False
+	frappe.init("")
 
-	if make_copy or restore:
-		hard_link = make_copy or restore
-		click.secho(
-			"bench build: --make-copy and --restore options are deprecated in favour of --hard-link",
-			fg="yellow",
+	if not apps and app:
+		apps = app
+
+	with filelock("bench_build", is_global=True, timeout=10):
+		# dont try downloading assets if force used, app specified or running via CI
+		if not (force or apps or os.environ.get("CI")):
+			# skip building frappe if assets exist remotely
+			skip_frappe = download_frappe_assets(verbose=verbose)
+		else:
+			skip_frappe = False
+
+		# don't minify in developer_mode for faster builds
+		development = frappe.local.conf.developer_mode or frappe.local.dev_server
+		mode = "development" if development else "production"
+		if production:
+			mode = "production"
+
+		if development:
+			using_cached = False
+
+		bundle(
+			mode,
+			apps=apps,
+			hard_link=hard_link,
+			verbose=verbose,
+			skip_frappe=skip_frappe,
+			save_metafiles=save_metafiles,
+			using_cached=using_cached,
 		)
 
-	frappe.build.bundle(
-		skip_frappe=skip_frappe,
-		no_compress=no_compress,
-		hard_link=hard_link,
-		verbose=verbose,
-		app=app,
-	)
+		if apps and isinstance(apps, str):
+			apps = apps.split(",")
+
+		if not apps:
+			apps = frappe.get_all_apps()
+
+		for app in apps:
+			print("Compiling translations for", app)
+			compile_translations(app, force=force)
 
 
-@click.command('watch')
-def watch():
-	"Watch and concatenate JS and CSS files as and when they change"
-	import frappe.build
-	frappe.init('')
-	frappe.build.watch(True)
+@click.command("watch")
+@click.option("--apps", help="Watch assets for specific apps")
+def watch(apps=None):
+	"Watch and compile JS and CSS files as and when they change"
+	from frappe.build import watch
+
+	frappe.init("")
+	watch(apps)
 
 
-@click.command('clear-cache')
+@click.command("clear-cache")
 @pass_context
 def clear_cache(context):
 	"Clear cache, doctype cache and defaults"
 	import frappe.sessions
-	import frappe.website.render
-	from frappe.desk.notifications import clear_notifications
-	for site in context.sites:
-		try:
-			frappe.connect(site)
-			frappe.clear_cache()
-			clear_notifications()
-			frappe.website.render.clear_cache()
-		finally:
-			frappe.destroy()
-	if not context.sites:
-		raise SiteNotSpecifiedError
+	from frappe.website.utils import clear_website_cache
 
-@click.command('clear-website-cache')
-@pass_context
-def clear_website_cache(context):
-	"Clear website cache"
-	import frappe.website.render
 	for site in context.sites:
 		try:
 			frappe.init(site=site)
 			frappe.connect()
-			frappe.website.render.clear_cache()
+			frappe.clear_cache()
+			clear_website_cache()
 		finally:
 			frappe.destroy()
 	if not context.sites:
 		raise SiteNotSpecifiedError
 
-@click.command('destroy-all-sessions')
-@click.option('--reason')
+
+@click.command("clear-website-cache")
+@pass_context
+def clear_website_cache(context):
+	"Clear website cache"
+	from frappe.website.utils import clear_website_cache
+
+	for site in context.sites:
+		try:
+			frappe.init(site=site)
+			frappe.connect()
+			clear_website_cache()
+		finally:
+			frappe.destroy()
+	if not context.sites:
+		raise SiteNotSpecifiedError
+
+
+@click.command("destroy-all-sessions")
+@click.option("--reason")
 @pass_context
 def destroy_all_sessions(context, reason=None):
 	"Clear sessions of all users (logs them out)"
@@ -644,20 +706,35 @@ def run_ui_tests(context, app, headless=False, parallel=True, ci_build_id=None):
 		and os.path.exists(testing_library_path)
 		and cint(subprocess.getoutput("npm view cypress version")[:1]) >= 6
 	):
-		# install cypress
+		# install cypress & dependent plugins
 		click.secho("Installing Cypress...", fg="yellow")
-		frappe.commands.popen("yarn add cypress@^6 cypress-file-upload@^5 @testing-library/cypress@^8 --no-lockfile")
+		packages = " ".join(
+			[
+				"cypress@^13",
+				"@4tw/cypress-drag-drop@^2",
+				"cypress-real-events",
+				"@testing-library/cypress@^10",
+				"@testing-library/dom@8.17.1",
+				"@cypress/code-coverage@^3",
+			]
+		)
+		frappe.commands.popen(f"(cd ../frappe && yarn add {packages} --no-lockfile)")
 
 	# run for headless mode
-	run_or_open = 'run --browser chrome --record' if headless else 'open'
-	command = '{site_env} {password_env} {cypress} {run_or_open}'
-	formatted_command = command.format(site_env=site_env, password_env=password_env, cypress=cypress_path, run_or_open=run_or_open)
+	run_or_open = f"run --browser {browser}" if headless else "open"
+	formatted_command = f"{site_env} {password_env} {coverage_env} {cypress_path} {run_or_open}"
+
+	if os.environ.get("CYPRESS_RECORD_KEY"):
+		formatted_command += " --record"
 
 	if parallel:
-		formatted_command += ' --parallel'
+		formatted_command += " --parallel"
 
 	if ci_build_id:
-		formatted_command += f' --ci-build-id {ci_build_id}'
+		formatted_command += f" --ci-build-id {ci_build_id}"
+
+	if cypressargs:
+		formatted_command += " " + " ".join(cypressargs)
 
 	click.secho("Running Cypress...", fg="yellow")
 	frappe.commands.popen(formatted_command, cwd=app_base_path, raise_err=True)

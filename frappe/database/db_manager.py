@@ -1,5 +1,5 @@
-import os
 import frappe
+from frappe import _
 
 
 class DbManager:
@@ -11,82 +11,78 @@ class DbManager:
 			self.db = db
 
 	def get_current_host(self):
-		return self.db.sql("select user()")[0][0].split('@')[1]
+		return self.db.sql("select user()")[0][0].split("@")[1]
 
 	def create_user(self, user, password, host=None):
-		# Create user if it doesn't exist.
-		if not host:
-			host = self.get_current_host()
-
-		if password:
-			self.db.sql("CREATE USER '%s'@'%s' IDENTIFIED BY '%s';" % (user, host, password))
-		else:
-			self.db.sql("CREATE USER '%s'@'%s';" % (user, host))
+		host = host or self.get_current_host()
+		password_predicate = f" IDENTIFIED BY '{password}'" if password else ""
+		self.db.sql(f"CREATE USER IF NOT EXISTS '{user}'@'{host}'{password_predicate}")
 
 	def delete_user(self, target, host=None):
-		if not host:
-			host = self.get_current_host()
-		try:
-			self.db.sql("DROP USER '%s'@'%s';" % (target, host))
-		except Exception as e:
-			if e.args[0] == 1396:
-				pass
-			else:
-				raise
+		host = host or self.get_current_host()
+		self.db.sql(f"DROP USER IF EXISTS '{target}'@'{host}'")
 
 	def create_database(self, target):
 		if target in self.get_database_list():
 			self.drop_database(target)
-
-		self.db.sql("CREATE DATABASE `%s` ;" % target)
+		self.db.sql(f"CREATE DATABASE `{target}`")
 
 	def drop_database(self, target):
-		self.db.sql("DROP DATABASE IF EXISTS `%s`;" % target)
+		self.db.sql_ddl(f"DROP DATABASE IF EXISTS `{target}`")
 
 	def grant_all_privileges(self, target, user, host=None):
-		if not host:
-			host = self.get_current_host()
-
-		if frappe.conf.get('rds_db', 0) == 1:
-			self.db.sql("GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, INDEX, ALTER, CREATE TEMPORARY TABLES, CREATE VIEW, EVENT, TRIGGER, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, EXECUTE, LOCK TABLES ON `%s`.* TO '%s'@'%s';" % (target, user, host))
-		else:
-			self.db.sql("GRANT ALL PRIVILEGES ON `%s`.* TO '%s'@'%s';" % (target, user, host))
+		host = host or self.get_current_host()
+		permissions = (
+			(
+				"SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, INDEX, ALTER, "
+				"CREATE TEMPORARY TABLES, CREATE VIEW, EVENT, TRIGGER, SHOW VIEW, "
+				"CREATE ROUTINE, ALTER ROUTINE, EXECUTE, LOCK TABLES"
+			)
+			if frappe.conf.rds_db
+			else "ALL PRIVILEGES"
+		)
+		self.db.sql(f"GRANT {permissions} ON `{target}`.* TO '{user}'@'{host}'")
 
 	def flush_privileges(self):
 		self.db.sql("FLUSH PRIVILEGES")
 
 	def get_database_list(self):
-		"""get list of databases"""
-		return [d[0] for d in self.db.sql("SHOW DATABASES")]
+		return self.db.sql("SHOW DATABASES", pluck=True)
 
 	@staticmethod
-	def restore_database(target, source, user, password):
-		from frappe.utils import make_esc
-		esc = make_esc('$ ')
+	def restore_database(verbose, target, source, user, password):
+		import shlex
+		from shutil import which
 
-		from distutils.spawn import find_executable
-		pv = find_executable('pv')
-		if pv:
-			pipe = '{pv} {source} |'.format(
-				pv=pv,
-				source=source
-			)
-			source = ''
+		from frappe.database import get_command
+		from frappe.utils import execute_in_shell
+
+		command = ["set -o pipefail;"]
+
+		if source.endswith(".gz"):
+			if gzip := which("gzip"):
+				command.extend([gzip, "-cd", source, "|"])
+				source = []
+			else:
+				raise Exception("`gzip` not installed")
+
 		else:
-			pipe = ''
-			source = '< {source}'.format(source=source)
+			source = ["<", source]
 
-		if pipe:
-			print('Restoring Database file...')
-
-		command = '{pipe} mysql -u {user} -p{password} -h{host} ' + ('-P{port}' if frappe.db.port else '') + ' {target} {source}'
-		command = command.format(
-			pipe=pipe,
-			user=esc(user),
-			password=esc(password),
-			host=esc(frappe.db.host),
-			target=esc(target),
-			source=source,
-			port=frappe.db.port
+		bin, args, bin_name = get_command(
+			host=frappe.conf.db_host,
+			port=frappe.conf.db_port,
+			user=user,
+			password=password,
+			db_name=target,
 		)
-		os.system(command)
+		if not bin:
+			frappe.throw(
+				_("{} not found in PATH! This is required to restore the database.").format(bin_name),
+				exc=frappe.ExecutableNotFound,
+			)
+		command.append(bin)
+		command.append(shlex.join(args))
+		command.extend(source)
+		execute_in_shell(" ".join(command), check_exit_code=True, verbose=verbose)
+		frappe.cache.delete_keys("")  # Delete all keys associated with this site.

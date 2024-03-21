@@ -1,95 +1,164 @@
 # Copyright (c) 2022, Frappe Technologies Pvt. Ltd. and Contributors
 # MIT License. See license.txt
 
-# Database Module
-# --------------------
-
-from __future__ import unicode_literals
-
-import datetime
+import itertools
+import json
+import random
 import re
+import string
+import traceback
+from collections.abc import Iterable, Sequence
+from contextlib import contextmanager, suppress
 from time import time
-from typing import Dict, List, Union
-from frappe.database.query import Query
+from typing import TYPE_CHECKING, Any
 
-from pypika.terms import NullValue
-from six import integer_types, string_types, text_type
+from pypika.dialects import MySQLQueryBuilder, PostgreSQLQueryBuilder
 
 import frappe
 import frappe.defaults
 import frappe.model.meta
 from frappe import _
-from frappe.model.utils.link_count import flush_local_link_count
-from frappe.query_builder.utils import DocType
-from frappe.utils import cast, get_datetime, get_table_name, getdate, now, sbool
+from frappe.database.utils import (
+	DefaultOrderBy,
+	EmptyQueryValues,
+	FallBackDateTimeStr,
+	LazyMogrify,
+	Query,
+	QueryValues,
+	is_query_type,
+)
+from frappe.exceptions import DoesNotExistError, ImplicitCommitError
+from frappe.monitor import get_trace_id
+from frappe.query_builder.functions import Count
+from frappe.utils import CallbackManager, cint, get_datetime, get_table_name, getdate, now, sbool
+from frappe.utils import cast as cast_fieldtype
+from frappe.utils.deprecations import deprecation_warning
+
+if TYPE_CHECKING:
+	from psycopg2 import connection as PostgresConnection
+	from psycopg2 import cursor as PostgresCursor
+	from pymysql.connections import Connection as MariadbConnection
+	from pymysql.cursors import Cursor as MariadbCursor
+
+IFNULL_PATTERN = re.compile(r"ifnull\(", flags=re.IGNORECASE)
+INDEX_PATTERN = re.compile(r"\s*\([^)]+\)\s*")
+SINGLE_WORD_PATTERN = re.compile(r'([`"]?)(tab([A-Z]\w+))\1')
+MULTI_WORD_PATTERN = re.compile(r'([`"])(tab([A-Z]\w+)( [A-Z]\w+)+)\1')
+
+SQL_ITERATOR_BATCH_SIZE = 100
 
 
-class Database(object):
+class Database:
 	"""
-	   Open a database connection with the given parmeters, if use_default is True, use the
-	   login details from `conf.py`. This is called by the request handler and is accessible using
-	   the `db` global variable. the `sql` method is also global to run queries
+	Open a database connection with the given parmeters, if use_default is True, use the
+	login details from `conf.py`. This is called by the request handler and is accessible using
+	the `db` global variable. the `sql` method is also global to run queries
 	"""
+
 	VARCHAR_LEN = 140
 	MAX_COLUMN_LENGTH = 64
 
-	OPTIONAL_COLUMNS = ["_user_tags", "_comments", "_assign", "_liked_by"]
-	DEFAULT_SHORTCUTS = ['_Login', '__user', '_Full Name', 'Today', '__today', "now", "Now"]
-	STANDARD_VARCHAR_COLUMNS = ('name', 'owner', 'modified_by', 'parent', 'parentfield', 'parenttype')
-	DEFAULT_COLUMNS = ['name', 'creation', 'modified', 'modified_by', 'owner', 'docstatus', 'parent',
-		'parentfield', 'parenttype', 'idx']
+	OPTIONAL_COLUMNS = ("_user_tags", "_comments", "_assign", "_liked_by")
+	DEFAULT_SHORTCUTS = ("_Login", "__user", "_Full Name", "Today", "__today", "now", "Now")
+	STANDARD_VARCHAR_COLUMNS = ("name", "owner", "modified_by")
+	DEFAULT_COLUMNS = ("name", "creation", "modified", "modified_by", "owner", "docstatus", "idx")
+	CHILD_TABLE_COLUMNS = ("parent", "parenttype", "parentfield")
 	MAX_WRITES_PER_TRANSACTION = 200_000
 
-	class InvalidColumnName(frappe.ValidationError): pass
+	class InvalidColumnName(frappe.ValidationError):
+		pass
 
-
-	def __init__(self, host=None, user=None, password=None, ac_name=None, use_default=0, port=None):
+	def __init__(
+		self,
+		host=None,
+		user=None,
+		password=None,
+		port=None,
+		cur_db_name=None,
+	):
 		self.setup_type_map()
-		self.host = host or frappe.conf.db_host or '127.0.0.1'
-		self.port = port or frappe.conf.db_port or ''
-		self.user = user or frappe.conf.db_name
-		self.db_name = frappe.conf.db_name
+		self.host = host
+		self.port = port
+		self.user = user
+		self.password = password
+		self.cur_db_name = cur_db_name
 		self._conn = None
-
-		if ac_name:
-			self.user = ac_name or frappe.conf.db_name
-
-		if use_default:
-			self.user = frappe.conf.db_name
 
 		self.transaction_writes = 0
 		self.auto_commit_on_many_writes = 0
 
-		self.password = password or frappe.conf.db_password
 		self.value_cache = {}
-		self.query = Query()
+		self.logger = frappe.logger("database")
+		self.logger.setLevel("WARNING")
+
+		self.before_commit = CallbackManager()
+		self.after_commit = CallbackManager()
+		self.before_rollback = CallbackManager()
+		self.after_rollback = CallbackManager()
+
+	# self.db_type: str
+	# self.last_query (lazy) attribute of last sql query executed
 
 	def setup_type_map(self):
 		pass
 
 	def connect(self):
 		"""Connects to a database as set in `site_config.json`."""
-		self.cur_db_name = self.user
-		self._conn = self.get_connection()
-		self._cursor = self._conn.cursor()
-		frappe.local.rollback_observers = []
+		self._conn: "MariadbConnection" | "PostgresConnection" = self.get_connection()
+		self._cursor: "MariadbCursor" | "PostgresCursor" = self._conn.cursor()
+
+		try:
+			if execution_timeout := get_query_execution_timeout():
+				self.set_execution_timeout(execution_timeout)
+		except Exception as e:
+			self.logger.warning(f"Couldn't set execution timeout {e}")
+
+	def set_execution_timeout(self, seconds: int):
+		"""Set session speicifc timeout on exeuction of statements.
+		If any statement takes more time it will be killed along with entire transaction."""
+		raise NotImplementedError
 
 	def use(self, db_name):
 		"""`USE` db_name."""
 		self._conn.select_db(db_name)
+		self.cur_db_name = db_name
 
 	def get_connection(self):
-		pass
+		"""Return a Database connection object that conforms with https://peps.python.org/pep-0249/#connection-objects."""
+		raise NotImplementedError
 
 	def get_database_size(self):
+		raise NotImplementedError
+
+	def _transform_query(self, query: Query, values: QueryValues) -> tuple:
+		return query, values
+
+	def _transform_result(self, result: list[tuple]) -> list[tuple]:
+		return result
+
+	def _clean_up(self):
 		pass
 
-	def sql(self, query, values=(), as_dict = 0, as_list = 0, formatted = 0,
-		debug=0, ignore_ddl=0, as_utf8=0, auto_commit=0, update=None, explain=False):
+	def sql(
+		self,
+		query: Query,
+		values: QueryValues = EmptyQueryValues,
+		*,
+		as_dict=0,
+		as_list=0,
+		debug=0,
+		ignore_ddl=0,
+		auto_commit=0,
+		update=None,
+		explain=False,
+		run=True,
+		pluck=False,
+		as_iterator=False,
+	):
 		"""Execute a SQL query and fetch all rows.
 
 		:param query: SQL query.
-		:param values: List / dict of values to be escaped and substituted in the query.
+		:param values: Tuple / List / Dict of values to be escaped and substituted in the query.
 		:param as_dict: Return as a dictionary.
 		:param as_list: Always return as a list.
 		:param formatted: Format values like date etc.
@@ -98,7 +167,12 @@ class Database(object):
 		:param as_utf8: Encode values as UTF 8.
 		:param auto_commit: Commit after executing the query.
 		:param update: Update this dict to all rows (if returned `as_dict`).
-
+		:param run: Return query without executing it if False.
+		:param pluck: Get the plucked field only.
+		:param explain: Print `EXPLAIN` in error log.
+		:param as_iterator: Returns iterator over results instead of fetching all results at once.
+		        This should be used with unbuffered cursor as default cursors used by pymysql and postgres
+		        buffer the results internally. See `Database.unbuffered_cursor`.
 		Examples:
 
 			# return customer names as dicts
@@ -112,70 +186,80 @@ class Database(object):
 				{"name": "a%", "owner":"test@example.com"})
 
 		"""
+		if isinstance(query, MySQLQueryBuilder | PostgreSQLQueryBuilder):
+			frappe.log("Use run method to execute SQL queries generated by Query Engine")
+
+		debug = debug or getattr(self, "debug", False)
 		query = str(query)
-		if re.search(r'ifnull\(', query, flags=re.IGNORECASE):
-			# replaces ifnull in query with coalesce
-			query = re.sub(r'ifnull\(', 'coalesce(', query, flags=re.IGNORECASE)
+		if not run:
+			return query
+
+		# remove whitespace / indentation from start and end of query
+		query = query.strip()
+
+		# replaces ifnull in query with coalesce
+		query = IFNULL_PATTERN.sub("coalesce(", query)
 
 		if not self._conn:
 			self.connect()
 
 		# in transaction validations
 		self.check_transaction_status(query)
-
 		self.clear_db_table_cache(query)
 
-		# autocommit
-		if auto_commit: self.commit()
+		if auto_commit:
+			self.commit()
 
-		# execute
+		if debug:
+			time_start = time()
+
+		if values == EmptyQueryValues:
+			values = None
+		elif not isinstance(values, tuple | dict | list):
+			values = (values,)
+
+		query, values = self._transform_query(query, values)
+
+		if trace_id := get_trace_id():
+			query += f" /* FRAPPE_TRACE_ID: {trace_id} */"
+
 		try:
-			if debug:
-				time_start = time()
-
-			self.log_query(query, values, debug, explain)
-
-			if values!=():
-				if isinstance(values, dict):
-					values = dict(values)
-
-				# MySQL-python==1.2.5 hack!
-				if not isinstance(values, (dict, tuple, list)):
-					values = (values,)
-
-				self._cursor.execute(query, values)
-
-				if frappe.flags.in_migrate:
-					self.log_touched_tables(query, values)
-
-			else:
-				self._cursor.execute(query)
-
-				if frappe.flags.in_migrate:
-					self.log_touched_tables(query)
-
-			if debug:
-				time_end = time()
-				frappe.errprint(("Execution time: {0} sec").format(round(time_end - time_start, 2)))
-
+			self._cursor.execute(query, values)
 		except Exception as e:
-			if frappe.conf.db_type == 'postgres':
-				self.rollback()
-
-			elif self.is_syntax_error(e):
-				# only for mariadb
-				frappe.errprint('Syntax error in query:')
-				frappe.errprint(query)
+			if self.is_syntax_error(e):
+				frappe.log(f"Syntax error in query:\n{query} {values or ''}")
 
 			elif self.is_deadlocked(e):
-				raise frappe.QueryDeadlockError(e)
+				raise frappe.QueryDeadlockError(e) from e
 
 			elif self.is_timedout(e):
-				raise frappe.QueryTimeoutError(e)
+				raise frappe.QueryTimeoutError(e) from e
 
-			if ignore_ddl and (self.is_missing_column(e) or self.is_missing_table(e) or self.cant_drop_field_or_key(e)):
-				pass
-			else:
+			elif self.is_read_only_mode_error(e):
+				frappe.throw(
+					_(
+						"Site is running in read only mode for maintenance or site update, this action can not be performed right now. Please try again later."
+					),
+					title=_("In Read Only Mode"),
+					exc=frappe.InReadOnlyMode,
+				)
+
+			# TODO: added temporarily
+			elif self.db_type == "postgres":
+				traceback.print_stack()
+				frappe.log(f"Error in query:\n{e}")
+				raise
+
+			elif isinstance(e, self.ProgrammingError):
+				if frappe.conf.developer_mode:
+					traceback.print_stack()
+					frappe.log(f"Error in query:\n{query, values}")
+				raise
+
+			if not (
+				ignore_ddl
+				and (self.is_missing_column(e) or self.is_table_missing(e) or self.cant_drop_field_or_key(e))
+			):
 				raise
 
 		if auto_commit: self.commit()
@@ -275,39 +359,25 @@ class Database(object):
 					msg += _("The changes have been reverted.") + "<br>"
 					raise frappe.TooManyWritesError(msg)
 
-	def fetch_as_dict(self, formatted=0, as_utf8=0):
-		"""Internal. Converts results to dict."""
-		result = self._cursor.fetchall()
-		ret = []
+	def check_implicit_commit(self, query: str):
+		if (
+			self.transaction_writes
+			and query
+			and is_query_type(query, ("start", "alter", "drop", "create", "begin", "truncate"))
+		):
+			raise ImplicitCommitError("This statement can cause implicit commit", query)
+
+	def fetch_as_dict(self, result) -> list[frappe._dict]:
+		"""Internal. Convert results to dict."""
 		if result:
 			keys = [column[0] for column in self._cursor.description]
 
-		for r in result:
-			values = []
-			for value in r:
-				if as_utf8 and isinstance(value, text_type):
-					value = value.encode('utf-8')
-				values.append(value)
-
-			ret.append(frappe._dict(zip(keys, values)))
-		return ret
+		return [frappe._dict(zip(keys, row, strict=False)) for row in result]
 
 	@staticmethod
 	def clear_db_table_cache(query):
-		if query and query.strip().split()[0].lower() in {'drop', 'create'}:
-			frappe.cache().delete_key('db_tables')
-
-	@staticmethod
-	def needs_formatting(result, formatted):
-		"""Returns true if the first row in the result has a Date, Datetime, Long Int."""
-		if result and result[0]:
-			for v in result[0]:
-				if isinstance(v, (datetime.date, datetime.timedelta, datetime.datetime, integer_types)):
-					return True
-				if formatted and isinstance(v, (int, float)):
-					return True
-
-		return False
+		if query and is_query_type(query, ("drop", "create")):
+			frappe.cache.delete_key("db_tables")
 
 	def get_description(self):
 		"""Returns result metadata."""
@@ -681,23 +751,8 @@ class Database(object):
 			frappe.clear_document_cache(dt, dt)
 
 		else:
-			table = DocType(dt)
-
-			if for_update:
-				docnames = tuple(
-					x[0] for x in self.get_values(dt, dn, "name", debug=debug, for_update=for_update)
-				) or (NullValue(),)
-				query = frappe.qb.update(table).where(table.name.isin(docnames))
-
-				for docname in docnames:
-					frappe.clear_document_cache(dt, docname)
-
-			else:
-				query = self.query.build_conditions(table=dt, filters=dn, update=True)
-				# TODO: Fix this; doesn't work rn - gavin@frappe.io
-				# frappe.cache().hdel_keys(dt, "document_cache")
-				# Workaround: clear all document caches
-				frappe.cache().delete_value('document_cache')
+			# No way to guess which documents are modified, clear all of them
+			frappe.clear_document_cache(dt)
 
 			for column, value in to_update.items():
 				query = query.set(column, value)
@@ -707,31 +762,7 @@ class Database(object):
 		if dt in self.value_cache:
 			del self.value_cache[dt]
 
-	@staticmethod
-	def set(doc, field, val):
-		"""Set value in document. **Avoid**"""
-		doc.db_set(field, val)
-
-	def touch(self, doctype, docname):
-		"""Update the modified timestamp of this document."""
-		modified = now()
-		self.sql("""update `tab{doctype}` set `modified`=%s
-			where name=%s""".format(doctype=doctype), (modified, docname))
-		return modified
-
-	@staticmethod
-	def set_temp(value):
-		"""Set a temperory value and return a key."""
-		key = frappe.generate_hash()
-		frappe.cache().hset("temp", key, value)
-		return key
-
-	@staticmethod
-	def get_temp(key):
-		"""Return the temperory value and delete it."""
-		return frappe.cache().hget("temp", key)
-
-	def set_global(self, key, val, user='__global'):
+	def set_global(self, key, val, user="__global"):
 		"""Save a global key value. Global values will be automatically set if they match fieldname."""
 		self.set_default(key, val, user)
 
@@ -956,13 +987,10 @@ class Database(object):
 	def get_index_name(fields):
 		index_name = "_".join(fields) + "_index"
 		# remove index length if present e.g. (10) from index name
-		index_name = re.sub(r"\s*\([^)]+\)\s*", r"", index_name)
-		return index_name
+		return INDEX_PATTERN.sub(r"", index_name)
 
 	def get_system_setting(self, key):
-		def _load_system_settings():
-			return self.get_singles_dict("System Settings")
-		return frappe.cache().get_value("system_settings", _load_system_settings).get(key)
+		return frappe.get_system_settings(key)
 
 	def close(self):
 		"""Close database connection."""
@@ -974,7 +1002,7 @@ class Database(object):
 
 	@staticmethod
 	def escape(s, percent=True):
-		"""Excape quotes and percent in given string."""
+		"""Escape quotes and percent in given string."""
 		# implemented in specific class
 		raise NotImplementedError
 
@@ -983,43 +1011,39 @@ class Database(object):
 		return frappe.db.is_missing_column(e)
 
 	def get_descendants(self, doctype, name):
-		'''Return descendants of the current record'''
-		node_location_indexes = self.get_value(doctype, name, ('lft', 'rgt'))
-		if node_location_indexes:
-			lft, rgt = node_location_indexes
-			return self.sql_list('''select name from `tab{doctype}`
-				where lft > {lft} and rgt < {rgt}'''.format(doctype=doctype, lft=lft, rgt=rgt))
-		else:
-			# when document does not exist
+		"""Return descendants of the group node in tree"""
+		from frappe.utils.nestedset import get_descendants_of
+
+		try:
+			return get_descendants_of(doctype, name, ignore_permissions=True)
+		except Exception:
+			# Can only happen if document doesn't exists - kept for backward compatibility
 			return []
 
 	def is_missing_table_or_column(self, e):
-		return self.is_missing_column(e) or self.is_missing_table(e)
+		return self.is_missing_column(e) or self.is_table_missing(e)
 
 	def multisql(self, sql_dict, values=(), **kwargs):
-		current_dialect = frappe.db.db_type or 'mariadb'
+		current_dialect = self.db_type or "mariadb"
 		query = sql_dict.get(current_dialect)
 		return self.sql(query, values, **kwargs)
 
-	def delete(self, doctype: str, filters: Union[Dict, List] = None, debug=False, **kwargs):
+	def delete(self, doctype: str, filters: dict | list | None = None, debug=False, **kwargs):
 		"""Delete rows from a table in site which match the passed filters. This
 		does trigger DocType hooks. Simply runs a DELETE query in the database.
 
 		Doctype name can be passed directly, it will be pre-pended with `tab`.
 		"""
-		values = ()
 		filters = filters or kwargs.get("conditions")
-		table = get_table_name(doctype)
-		query = f"DELETE FROM `{table}`"
-
+		query = frappe.qb.get_query(
+			table=doctype,
+			filters=filters,
+			delete=True,
+			validate_filters=True,
+		)
 		if "debug" not in kwargs:
 			kwargs["debug"] = debug
-
-		if filters:
-			conditions, values = self.build_conditions(filters)
-			query = f"{query} WHERE {conditions}"
-
-		return self.sql(query, values, **kwargs)
+		return query.run(**kwargs)
 
 	def truncate(self, doctype: str):
 		"""Truncate a table in the database. This runs a DDL command `TRUNCATE TABLE`.
@@ -1027,33 +1051,24 @@ class Database(object):
 
 		Doctype name can be passed directly, it will be pre-pended with `tab`.
 		"""
-		table = doctype if doctype.startswith("__") else f"tab{doctype}"
-		return self.sql_ddl(f"truncate `{table}`")
-
-	def clear_table(self, doctype):
-		return self.truncate(doctype)
+		return self.sql_ddl(f"truncate `{get_table_name(doctype)}`")
 
 	def get_last_created(self, doctype):
-		last_record = self.get_all(doctype, ('creation'), limit=1, order_by='creation desc')
+		last_record = self.get_all(doctype, ("creation"), limit=1, order_by="creation desc")
 		if last_record:
 			return get_datetime(last_record[0].creation)
 		else:
 			return None
 
-	def clear_table(self, doctype):
-		self.sql('truncate `tab{}`'.format(doctype))
-
-	def log_touched_tables(self, query, values=None):
-		if values:
-			query = frappe.safe_decode(self._cursor.mogrify(query, values))
-		if query.strip().lower().split()[0] in ('insert', 'delete', 'update', 'alter', 'drop', 'rename'):
+	def log_touched_tables(self, query):
+		if is_query_type(query, ("insert", "delete", "update", "alter", "drop", "rename")):
 			# single_word_regex is designed to match following patterns
 			# `tabXxx`, tabXxx and "tabXxx"
 
 			# multi_word_regex is designed to match following patterns
 			# `tabXxx Xxx` and "tabXxx Xxx"
 
-			# ([`"]?) Captures " or ` at the begining of the table name (if provided)
+			# ([`"]?) Captures " or ` at the beginning of the table name (if provided)
 			# \1 matches the first captured group (quote character) at the end of the table name
 			# multi word table name must have surrounding quotes.
 
@@ -1061,45 +1076,130 @@ class Database(object):
 			# and are continued with multiple words that start with a captital letter
 			# e.g. 'tabXxx' or 'tabXxx Xxx' or 'tabXxx Xxx Xxx' and so on
 
-			single_word_regex = r'([`"]?)(tab([A-Z]\w+))\1'
-			multi_word_regex = r'([`"])(tab([A-Z]\w+)( [A-Z]\w+)+)\1'
 			tables = []
-			for regex in (single_word_regex, multi_word_regex):
-				tables += [groups[1] for groups in re.findall(regex, query)]
+			for regex in (SINGLE_WORD_PATTERN, MULTI_WORD_PATTERN):
+				tables += [groups[1] for groups in regex.findall(query)]
 
 			if frappe.flags.touched_tables is None:
 				frappe.flags.touched_tables = set()
 			frappe.flags.touched_tables.update(tables)
 
-	def bulk_insert(self, doctype, fields, values, ignore_duplicates=False):
+	def bulk_insert(
+		self,
+		doctype: str,
+		fields: list[str],
+		values: Iterable[Sequence[Any]],
+		ignore_duplicates=False,
+		*,
+		chunk_size=10_000,
+	):
 		"""
-			Insert multiple records at a time
+		Insert multiple records at a time
 
-			:param doctype: Doctype name
-			:param fields: list of fields
-			:params values: list of list of values
+		:param doctype: Doctype name
+		:param fields: list of fields
+		:params values: iterable of values
 		"""
-		insert_list = []
-		fields = ", ".join(["`"+field+"`" for field in fields])
+		table = frappe.qb.DocType(doctype)
 
-		for idx, value in enumerate(values):
-			insert_list.append(tuple(value))
-			if idx and (idx%10000 == 0 or idx < len(values)-1):
-				self.sql("""INSERT {ignore_duplicates} INTO `tab{doctype}` ({fields}) VALUES {values}""".format(
-						ignore_duplicates="IGNORE" if ignore_duplicates else "",
-						doctype=doctype,
-						fields=fields,
-						values=", ".join(['%s'] * len(insert_list))
-					), tuple(insert_list))
-				insert_list = []
+		query = frappe.qb.into(table).columns(fields)
+
+		if ignore_duplicates:
+			# Pypika does not have same api for ignoring duplicates
+			if frappe.conf.db_type == "mariadb":
+				query = query.ignore()
+			elif frappe.conf.db_type == "postgres":
+				query = query.on_conflict().do_nothing()
+
+		value_iterator = iter(values)
+		while value_chunk := tuple(itertools.islice(value_iterator, chunk_size)):
+			query.insert(*value_chunk).run()
+
+	def create_sequence(self, *args, **kwargs):
+		from frappe.database.sequence import create_sequence
+
+		return create_sequence(*args, **kwargs)
+
+	def set_next_sequence_val(self, *args, **kwargs):
+		from frappe.database.sequence import set_next_val
+
+		set_next_val(*args, **kwargs)
+
+	def get_next_sequence_val(self, *args, **kwargs):
+		from frappe.database.sequence import get_next_val
+
+		return get_next_val(*args, **kwargs)
+
+	def get_row_size(self, doctype: str) -> int:
+		"""Get estimated max row size of any table in bytes."""
+		raise NotImplementedError
+
+	def rename_column(self, doctype: str, old_column_name: str, new_column_name: str):
+		raise NotImplementedError
+
+	@contextmanager
+	def unbuffered_cursor(self):
+		"""Context manager to temporarily use unbuffered cursor.
+
+		Using this with `as_iterator=True` provides O(1) memory usage while reading large result sets.
+
+		NOTE: You MUST do entire result set processing in the context, otherwise underlying cursor
+		will be switched and you'll not get complete results.
+
+		Usage:
+		        with frappe.db.unbuffered_cursor():
+		                for row in frappe.db.sql("query with huge result", as_iterator=True):
+		                        continue # Do some processing.
+		"""
+		raise NotImplementedError
 
 
-def enqueue_jobs_after_commit():
-	from frappe.utils.background_jobs import execute_job, get_queue
+@contextmanager
+def savepoint(catch: type | tuple[type, ...] = Exception):
+	"""Wrapper for wrapping blocks of DB operations in a savepoint.
 
-	if frappe.flags.enqueue_after_commit and len(frappe.flags.enqueue_after_commit) > 0:
-		for job in frappe.flags.enqueue_after_commit:
-			q = get_queue(job.get("queue"), is_async=job.get("is_async"))
-			q.enqueue_call(execute_job, timeout=job.get("timeout"),
-							kwargs=job.get("queue_args"))
-		frappe.flags.enqueue_after_commit = []
+	as contextmanager:
+
+	for doc in docs:
+	        with savepoint(catch=DuplicateError):
+	                doc.insert()
+
+	as decorator (wraps FULL function call):
+
+	@savepoint(catch=DuplicateError)
+	def process_doc(doc):
+	        doc.insert()
+	"""
+	try:
+		savepoint = "".join(random.sample(string.ascii_lowercase, 10))
+		frappe.db.savepoint(savepoint)
+		yield  # control back to calling function
+	except catch:
+		frappe.db.rollback(save_point=savepoint)
+	else:
+		frappe.db.release_savepoint(savepoint)
+
+
+def get_query_execution_timeout() -> int:
+	"""Get execution timeout based on current timeout in different contexts.
+
+	    HTTP requests: HTTP timeout or a default (300)
+	    Background jobs: Job timeout
+	Console/Commands: No timeout = 0.
+
+	    Note: Timeout adds 1.5x as "safety factor"
+	"""
+	from rq import get_current_job
+
+	if not frappe.conf.get("enable_db_statement_timeout"):
+		return 0
+
+	# Zero means no timeout, which is the default value in db.
+	timeout = 0
+	with suppress(Exception):
+		if getattr(frappe.local, "request", None):
+			timeout = frappe.conf.http_timeout or 300
+		elif job := get_current_job():
+			timeout = job.timeout
+
+	return int(cint(timeout) * 1.5)

@@ -6,7 +6,7 @@ from __future__ import unicode_literals
 from six import iteritems, string_types
 
 """build query for doclistview and return results"""
-
+from frappe.database.utils import FallBackDateTimeStr
 from typing import List
 import frappe.defaults
 import frappe.share
@@ -486,7 +486,8 @@ class DatabaseQuery(object):
 				date_range = get_date_range(f.operator.lower(), f.value)
 				f.operator = "Between"
 				f.value = date_range
-				fallback = "'0001-01-01 00:00:00'"
+				# fallback = "'0001-01-01 00:00:00'"
+				fallback = f"'{FallBackDateTimeStr}'"
 
 			if f.operator in ('>', '<') and (f.fieldname in ('creation', 'modified')):
 				value = cstr(f.value)
@@ -496,7 +497,8 @@ class DatabaseQuery(object):
 				(f.fieldname in ('creation', 'modified') or (df and (df.fieldtype=="Date" or df.fieldtype=="Datetime"))):
 
 				value = get_between_date_filter(f.value, df)
-				fallback = "'0001-01-01 00:00:00'"
+				# fallback = "'0001-01-01 00:00:00'"
+				fallback = f"'{FallBackDateTimeStr}'"
 
 			elif f.operator.lower() == "is":
 				if f.value == 'set':
@@ -517,7 +519,8 @@ class DatabaseQuery(object):
 
 			elif (df and df.fieldtype=="Datetime") or isinstance(f.value, datetime):
 				value = frappe.db.format_datetime(f.value)
-				fallback = "'0001-01-01 00:00:00'"
+				# fallback = "'0001-01-01 00:00:00'"
+				fallback = f"'{FallBackDateTimeStr}'"
 
 			elif df and df.fieldtype=="Time":
 				value = get_time(f.value).strftime("%H:%M:%S.%f")
@@ -564,7 +567,8 @@ class DatabaseQuery(object):
 
 		return condition
 
-	def build_match_conditions(self, as_condition=True):
+	# def build_match_conditions(self, as_condition=True):
+	def build_match_conditions(self, as_condition=True) -> str | list:
 		"""add match conditions if applicable"""
 		self.match_filters = []
 		self.match_conditions = []

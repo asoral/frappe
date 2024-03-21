@@ -1,14 +1,38 @@
-# Copyright (c) 2015, Frappe Technologies Pvt. Ltd. and Contributors
-# MIT License. See license.txt
-
+# Copyright (c) 2022, Frappe Technologies Pvt. Ltd. and Contributors
+# License: MIT. See LICENSE
+import configparser
+import gzip
 import json
 import os
+import re
+import subprocess
 import sys
 from collections import OrderedDict
-from typing import List, Dict
+from contextlib import suppress
+from shutil import which
+
+import click
+from semantic_version import Version
 
 import frappe
 from frappe.defaults import _clear_cache
+from frappe.utils import cint, is_git_url
+from frappe.utils.dashboard import sync_dashboards
+from frappe.utils.synchronization import filelock
+
+
+def _is_scheduler_enabled(site) -> bool:
+	enable_scheduler = False
+	try:
+		frappe.init(site=site)
+		frappe.connect()
+		enable_scheduler = cint(frappe.db.get_single_value("System Settings", "enable_scheduler"))
+	except Exception:
+		pass
+	finally:
+		frappe.db.close()
+
+	return bool(enable_scheduler)
 
 
 def _new_site(
@@ -27,7 +51,8 @@ def _new_site(
 	db_type=None,
 	db_host=None,
 	db_port=None,
-	new_site=False,
+	db_user=None,
+	setup_db=True,
 ):
 	"""Install a new Frappe site"""
 

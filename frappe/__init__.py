@@ -10,70 +10,94 @@ be used to build database driven apps.
 
 Read the documentation: https://frappeframework.com/docs
 """
-import os, warnings
+import copy
+import faulthandler
+import functools
+import gc
+import importlib
+import inspect
+import json
+import os
+import re
+import signal
+import traceback
+import warnings
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Literal, Optional, TypeAlias, overload
 
-_dev_server = os.environ.get('DEV_SERVER', False)
-
-if _dev_server:
-	warnings.simplefilter('always', DeprecationWarning)
-	warnings.simplefilter('always', PendingDeprecationWarning)
-
-from six import iteritems, binary_type, text_type, string_types
-from werkzeug.local import Local, release_local
-import sys, importlib, inspect, json
-import typing
-from past.builtins import cmp
 import click
+from werkzeug.local import Local, release_local
+
+import frappe
+from frappe.query_builder import (
+	get_query,
+	get_query_builder,
+	patch_query_aggregation,
+	patch_query_execute,
+)
+from frappe.utils.caching import request_cache
+from frappe.utils.data import cint, cstr, sbool
 
 # Local application imports
 from .exceptions import *
-from .utils.jinja import (get_jenv, get_template, render_template, get_email_from_template, get_jloader)
-from .utils.lazy_loader import lazy_import
+from .utils.jinja import (
+	get_email_from_template,
+	get_jenv,
+	get_jloader,
+	get_template,
+	render_template,
+)
 
-from frappe.query_builder import get_query_builder, patch_query_execute
-
-# Lazy imports
-faker = lazy_import('faker')
-
-__version__ = '13.22.1'
-
+__version__ = "16.0.0-dev"
 __title__ = "Frappe Framework"
 
-local = Local()
 controllers = {}
+local = Local()
+cache = None
+STANDARD_USERS = ("Guest", "Administrator")
+
+_qb_patched = {}
+_dev_server = int(sbool(os.environ.get("DEV_SERVER", False)))
+_tune_gc = bool(sbool(os.environ.get("FRAPPE_TUNE_GC", True)))
+
+if _dev_server:
+	warnings.simplefilter("always", DeprecationWarning)
+	warnings.simplefilter("always", PendingDeprecationWarning)
+
 
 class _dict(dict):
 	"""dict like object that exposes keys as attributes"""
-	def __getattr__(self, key):
-		ret = self.get(key)
-		# "__deepcopy__" exception added to fix frappe#14833 via DFP
-		if not ret and key.startswith("__") and key != "__deepcopy__":
-			raise AttributeError()
-		return ret
-	def __setattr__(self, key, value):
-		self[key] = value
+
+	__slots__ = ()
+	__getattr__ = dict.get
+	__setattr__ = dict.__setitem__
+	__delattr__ = dict.__delitem__
+	__setstate__ = dict.update
+
 	def __getstate__(self):
 		return self
-	def __setstate__(self, d):
-		self.update(d)
-	def update(self, d):
+
+	def update(self, *args, **kwargs):
 		"""update and return self -- the missing dict feature in python"""
-		super(_dict, self).update(d)
+
+		super().update(*args, **kwargs)
 		return self
+
 	def copy(self):
-		return _dict(dict(self).copy())
+		return _dict(self)
 
-def _(msg, lang=None, context=None):
-	"""Returns translated string in current lang, if exists.
-		Usage:
-			_('Change')
-			_('Change', context='Coins')
+
+def _(msg: str, lang: str | None = None, context: str | None = None) -> str:
+	"""Return translated string in current lang, if exists.
+	Usage:
+	        _('Change')
+	        _('Change', context='Coins')
 	"""
-	from frappe.translate import get_full_dict
-	from frappe.utils import strip_html_tags, is_html
+	from frappe.translate import get_all_translations
+	from frappe.utils import is_html, strip_html_tags
 
-	if not hasattr(local, 'lang'):
-		local.lang = lang or 'en'
+	if not hasattr(local, "lang"):
+		local.lang = lang or "en"
 
 	if not lang:
 		lang = local.lang
@@ -86,20 +110,75 @@ def _(msg, lang=None, context=None):
 	# msg should always be unicode
 	msg = as_unicode(msg).strip()
 
-	translated_string = ''
+	translated_string = ""
+
+	all_translations = get_all_translations(lang)
 	if context:
-		string_key = '{msg}:{context}'.format(msg=msg, context=context)
-		translated_string = get_full_dict(lang).get(string_key)
+		string_key = f"{msg}:{context}"
+		translated_string = all_translations.get(string_key)
 
 	if not translated_string:
-		translated_string = get_full_dict(lang).get(msg)
+		translated_string = all_translations.get(msg)
 
-	# return lang_full_dict according to lang passed parameter
 	return translated_string or non_translated_string
 
-def as_unicode(text, encoding='utf-8'):
-	'''Convert to unicode if required'''
-	if isinstance(text, text_type):
+
+def _lt(msg: str, lang: str | None = None, context: str | None = None):
+	"""Lazily translate a string.
+
+
+	This function returns a "lazy string" which when casted to string via some operation applies
+	translation first before casting.
+
+	This is only useful for translating strings in global scope or anything that potentially runs
+	before `frappe.init()`
+
+	Note: Result is not guaranteed to equivalent to pure strings for all operations.
+	"""
+	return _LazyTranslate(msg, lang, context)
+
+
+@functools.total_ordering
+class _LazyTranslate:
+	__slots__ = ("msg", "lang", "context")
+
+	def __init__(self, msg: str, lang: str | None = None, context: str | None = None) -> None:
+		self.msg = msg
+		self.lang = lang
+		self.context = context
+
+	@property
+	def value(self) -> str:
+		return _(str(self.msg), self.lang, self.context)
+
+	def __str__(self):
+		return self.value
+
+	def __add__(self, other):
+		if isinstance(other, str | _LazyTranslate):
+			return self.value + str(other)
+		raise NotImplementedError
+
+	def __radd__(self, other):
+		if isinstance(other, str | _LazyTranslate):
+			return str(other) + self.value
+		return NotImplementedError
+
+	def __repr__(self) -> str:
+		return f"'{self.value}'"
+
+	# NOTE: it's required to override these methods and raise error as default behaviour will
+	# return `False` in all cases.
+	def __eq__(self, other):
+		raise NotImplementedError
+
+	def __lt__(self, other):
+		raise NotImplementedError
+
+
+def as_unicode(text, encoding: str = "utf-8") -> str:
+	"""Convert to unicode if required."""
+	if isinstance(text, str):
 		return text
 	elif text==None:
 		return ''
@@ -898,7 +977,8 @@ def get_doc(*args, **kwargs):
 
 	return doc
 
-def get_last_doc(doctype, filters=None, order_by="creation desc"):
+
+def get_last_doc(doctype, filters=None, order_by="creation desc", *, for_update=False):
 	"""Get last created document of this type."""
 	d = get_all(
 		doctype,
@@ -908,7 +988,7 @@ def get_last_doc(doctype, filters=None, order_by="creation desc"):
 		pluck="name"
 	)
 	if d:
-		return get_doc(doctype, d[0])
+		return get_doc(doctype, d[0], for_update=for_update)
 	else:
 		raise DoesNotExistError
 
